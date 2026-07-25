@@ -1,0 +1,13 @@
+[account]
+label = "Первый"
+mexc_uid = "WEB076884b390cf31fbf17b446255157cf990e3ee67686bd89131fbb6be2b877777"
+proxy_url = "http://TIXL40TH:O4CLZXPM@149.62.36.72:45372"
+
+[trading]
+symbols = ["TAOUSDT", "ASTERUSDT", "PENGUUSDT", "ZECUSDT", "ENAUSDT", "NVDAUSDT", "BCHUSDT", "LINKUSDT", "HYPEUSDT", "XLMUSDT", "HBARUSDT", "XAUTUSDT", "XAGUSDT", "SOLUSDT", "XRPUSDT", "SUIUSDT", "DASHUSDT", "ADAUSDT", "BNBUSDT", "LTCUSDT", "AVAXUSDT", "WLDUSDT", "XMRUSDT", "ARBUSDT", "WIFUSDT", "KASUSDT", "TRUMPUSDT", "DOGEUSDT", "ORDIUSDT", "SIRENUSDT", "PUMPUSDT", "PIPPINUSDT", "MUUSDT", "SNDKUSDT", "GIGGLEUSDT", "FHEUSDT", "WLFIUSDT", "MEGAUSDT", "BLESSUSDT", "CRVUSDT", "XPLUSDT", "ZROUSDT", "LYNUSDT", "POLUSDT", "INTCUSDT", "ETCUSDT", "XANUSDT", "ETHFIUSDT", "MSTRUSDT", "STRKUSDT", "TSLAUSDT", "JASMYUSDT", "LIGHTUSDT", "AAPLUSDT"]
+min_spread_pct = 0.10  # mінімальний спред для входу
+converge_threshold_pct = 0.02  # коли закриваємо при сходженні
+size_usdt = 4000      # розмір позиції в USDT
+
+[server]
+listen = "0.0.0.0:8080"

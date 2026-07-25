@@ -1,0 +1,161 @@
+use md5::{Md5, Digest};
+use serde_json::{json, Value};
+use rquest::Client;
+use std::time::Duration;
+
+const BASE_URL: &str = "https://www.mexc.com/api/platform/futures/api/v1";
+const CONTRACT_URL: &str = "https://contract.mexc.com/api/v1";
+
+type DynErr = Box<dyn std::error::Error + Send + Sync>;
+
+fn md5_hex(s: &str) -> String {
+    let mut h = Md5::new();
+    h.update(s.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn sign(u_id: &str, body: &str) -> (String, String) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap()
+        .as_millis().to_string();
+    let d = &md5_hex(&format!("{}{}", u_id, nonce))[7..];
+    let s = md5_hex(&format!("{}{}{}", nonce, body, d));
+    (nonce, s)
+}
+
+fn cookie(u_id: &str) -> String {
+    format!("u_id={}; uc_token={}", u_id, u_id)
+}
+
+async fn parse_json(resp: rquest::Response) -> Result<Value, DynErr> {
+    let bytes = resp.bytes().await?;
+    let v: Value = serde_json::from_slice(&bytes)?;
+    Ok(v)
+}
+
+#[derive(Clone)]
+pub struct MexcClient {
+    pub client: Client,
+    /// Окремий клієнт виключно для open_order/close_position_fast.
+    /// HTTP/1.1, окремий connection pool — щоб торгові ордера не чекали
+    /// у TCP-черзі за WS-трафіком та fetch_depth-запитами.
+    pub client_trade: Client,
+    pub u_id: String,
+}
+
+impl MexcClient {
+    pub fn new(u_id: String, proxy_url: &str) -> Result<Self, DynErr> {
+        // Загальний клієнт (HTTP/2, дефолт rquest)
+        let client = rquest::Client::builder()
+            .emulation(rquest_util::Emulation::Chrome131)
+            .proxy(rquest::Proxy::all(proxy_url)?)
+            .timeout(Duration::from_secs(5))
+            .build()?;
+
+        // Торговий клієнт: HTTP/1.1, окремий пул, агресивний keep-alive.
+        // HTTP/1.1 уникає HOL-блокування на HTTP/2 stream-каналах
+        // (коли інший запит "тримає" stream і POST чекає черги).
+        let client_trade = rquest::Client::builder()
+            .emulation(rquest_util::Emulation::Chrome131)
+            .proxy(rquest::Proxy::all(proxy_url)?)
+            .timeout(Duration::from_secs(5))
+            .http1_only()
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(15))
+            .tcp_nodelay(true)
+            .build()?;
+
+        Ok(Self { client, client_trade, u_id })
+    }
+
+    pub async fn open_order(&self, symbol: &str, side: i32, vol: f64, leverage: i32) -> Result<Value, DynErr> {
+        let sym = if symbol.contains('_') { symbol.to_string() } else { symbol.replace("USDT", "_USDT") };
+        let body = json!({
+            "symbol": sym, "side": side, "openType": 1, "type": 5,
+            "vol": vol, "leverage": leverage, "positionMode": 1, "reduceOnly": false
+        }).to_string();
+        let (nonce, s) = sign(&self.u_id, &body);
+        let resp = self.client_trade
+            .post(format!("{}/private/order/create", BASE_URL))
+            .header("Authorization", &self.u_id)
+            .header("x-mxc-nonce", &nonce)
+            .header("x-mxc-sign", &s)
+            .header("Content-Type", "application/json")
+            .header("Cookie", cookie(&self.u_id))
+            .body(body)
+            .send().await?;
+        parse_json(resp).await
+    }
+
+    pub async fn close_position_fast(&self, symbol: &str, position_id: i64, vol: f64, orig_side: i32) -> Result<Value, DynErr> {
+        let sym = if symbol.contains('_') { symbol.to_string() } else { symbol.replace("USDT", "_USDT") };
+        let close_side = if orig_side == 1 { 4 } else { 2 };
+        let body = json!({
+            "symbol": sym, "side": close_side, "openType": 1, "type": 5,
+            "vol": vol, "positionId": position_id,
+            "positionMode": 1, "reduceOnly": true
+        }).to_string();
+        let (nonce, s) = sign(&self.u_id, &body);
+        let resp = self.client_trade
+            .post(format!("{}/private/order/create", BASE_URL))
+            .header("Authorization", &self.u_id)
+            .header("x-mxc-nonce", &nonce)
+            .header("x-mxc-sign", &s)
+            .header("Content-Type", "application/json")
+            .header("Cookie", cookie(&self.u_id))
+            .body(body)
+            .send().await?;
+        parse_json(resp).await
+    }
+
+    pub async fn get_positions(&self, symbol: Option<&str>) -> Result<Value, DynErr> {
+        let url = if let Some(s) = symbol {
+            let sym = if s.contains('_') { s.to_string() } else { s.replace("USDT", "_USDT") };
+            format!("{}/private/position/open_positions?symbol={}", CONTRACT_URL, sym)
+        } else {
+            format!("{}/private/position/open_positions", CONTRACT_URL)
+        };
+        let (nonce, s) = sign(&self.u_id, "");
+        let resp = self.client
+            .get(url)
+            .header("Authorization", &self.u_id)
+            .header("x-mxc-nonce", &nonce)
+            .header("x-mxc-sign", &s)
+            .header("Content-Type", "application/json")
+            .header("Cookie", cookie(&self.u_id))
+            .send().await?;
+        parse_json(resp).await
+    }
+
+    pub async fn get_balance(&self) -> Result<f64, DynErr> {
+        let (nonce, s) = sign(&self.u_id, "");
+        let resp = self.client
+            .get(format!("{}/private/account/assets", CONTRACT_URL))
+            .header("Authorization", &self.u_id)
+            .header("x-mxc-nonce", &nonce)
+            .header("x-mxc-sign", &s)
+            .header("Content-Type", "application/json")
+            .header("Cookie", cookie(&self.u_id))
+            .send().await?;
+        let v = parse_json(resp).await?;
+        let arr = v.get("data").and_then(|d| d.as_array());
+        if let Some(arr) = arr {
+            for a in arr {
+                if a.get("currency").and_then(|c| c.as_str()) == Some("USDT") {
+                    let avail = a.get("availableBalance").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let frozen = a.get("frozenBalance").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    return Ok(avail + frozen);
+                }
+            }
+        }
+        Ok(0.0)
+    }
+
+    pub async fn fetch_depth(&self, symbol: &str, limit: u32) -> Result<Value, DynErr> {
+        let sym = if symbol.contains('_') { symbol.to_string() } else { symbol.replace("USDT", "_USDT") };
+        let url = format!("{}/contract/depth/{}?limit={}", CONTRACT_URL, sym, limit);
+        let resp = self.client.get(url).send().await?;
+        parse_json(resp).await
+    }
+}

@@ -1,0 +1,49 @@
+mod config;
+mod state;
+mod mexc;
+
+use std::time::Instant;
+
+type DynErr = Box<dyn std::error::Error + Send + Sync>;
+
+#[tokio::main]
+async fn main() -> Result<(), DynErr> {
+    let cfg = config::Config::load("config.toml")?;
+    println!("✅ Config loaded: account={}, symbols={:?}", cfg.account.label, cfg.trading.symbols);
+
+    let _state = state::State::new();
+    println!("✅ State created");
+
+    let client = mexc::http::MexcClient::new(cfg.account.mexc_uid.clone(), &cfg.account.proxy_url)?;
+    println!("✅ MEXC client created");
+
+    let bal = client.get_balance().await?;
+    println!("✅ Balance: {} USDT", bal);
+
+    let pos = client.get_positions(None).await?;
+    println!("✅ Positions: {:?}", pos.get("data"));
+
+    let depth = client.fetch_depth("TAO_USDT", 5).await?;
+    if let Some(d) = depth.get("data") {
+        if let Some(asks) = d.get("asks").and_then(|a| a.as_array()) {
+            if let Some(first) = asks.first() {
+                println!("✅ TAO best ask: {:?}", first);
+            }
+        }
+    }
+
+    println!("\n=== Speed test: 5 open_order calls ===");
+    let mut times = Vec::new();
+    for i in 1..=5 {
+        let t0 = Instant::now();
+        let _ = client.open_order("TAO_USDT", 1, 0.0, 200).await;
+        let dt = t0.elapsed().as_millis();
+        times.push(dt);
+        println!("#{}: {}ms", i, dt);
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    }
+    times.sort();
+    println!("Min: {}ms, Median: {}ms, Max: {}ms", times[0], times[2], times[4]);
+
+    Ok(())
+}

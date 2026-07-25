@@ -1,0 +1,233 @@
+//! Стратегія: підписується на broadcast price_updates, реагує миттєво.
+//! Hot path — мінімум алокацій, мінімум логів до виклику open_order.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use tokio::sync::broadcast::error::RecvError;
+use tracing::{info, warn};
+
+use crate::config::{contract_size, leverage, Config};
+use crate::mexc::http::MexcClient;
+use crate::state::{now_ms, State, Trade};
+
+/// Максимальний age (мс) для свіжості ціни. Старіше — пропускаємо.
+const MAX_PRICE_AGE_MS: u64 = 500;
+
+/// Cooldown після закриття позиції (мс) — щоб не зайти миттєво на тих самих даних.
+const COOLDOWN_MS: u64 = 1000;
+
+/// MEXC side codes (з http.rs):
+/// 1 = open LONG, 3 = open SHORT
+const SIDE_OPEN_LONG: i32 = 1;
+const SIDE_OPEN_SHORT: i32 = 3;
+
+pub async fn run_strategy(cfg: Arc<Config>, state: Arc<State>, http: MexcClient) {
+    let mut rx = state.price_updates.subscribe();
+    info!(target: "strategy", "started, min_spread={}%, size={} USDT",
+          cfg.trading.min_spread_pct, cfg.trading.size_usdt);
+
+    loop {
+        // Чекаємо тригер. RecvError::Lagged — це коли broadcast пропустив повідомлення
+        // (стратегія повільніша за push). Просто продовжуємо — стан state вже актуальний.
+        match rx.recv().await {
+            Ok(()) => {}
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => {
+                warn!(target: "strategy", "price_updates closed, exiting");
+                return;
+            }
+        }
+
+        // Hot path. Намагаємось бути максимально швидкими.
+        check_and_trade(&cfg, &state, &http).await;
+    }
+}
+
+#[inline]
+async fn check_and_trade(cfg: &Config, state: &Arc<State>, http: &MexcClient) {
+    // 1. Уже є відкрита позиція? — пропускаємо
+    if state.open_trade.read().is_some() {
+        return;
+    }
+
+    // 2. Cooldown
+    let now = now_ms();
+    let cd_until = state.cooldown_until_ms.load(Ordering::Relaxed);
+    if now < cd_until {
+        return;
+    }
+
+    // 3. Перевіряємо кожен символ. Якщо знайшли сигнал — відкриваємо і виходимо
+    //    (не дозволяємо одночасно дві позиції в одному тіку).
+    for sym in &cfg.trading.symbols {
+        if try_signal(cfg, state, http, sym, now).await {
+            return;
+        }
+    }
+}
+
+/// Повертає true якщо позиція відкрита.
+async fn try_signal(
+    cfg: &Config,
+    state: &Arc<State>,
+    http: &MexcClient,
+    sym: &str,
+    now: u64,
+) -> bool {
+    // Атомарне читання обох цін з DashMap
+    let mexc = match state.mexc_prices.get(sym) {
+        Some(p) => *p,
+        None => return false,
+    };
+    let bnc = match state.binance_prices.get(sym) {
+        Some(p) => *p,
+        None => return false,
+    };
+
+    // Свіжість
+    if now.saturating_sub(mexc.timestamp_ms) > MAX_PRICE_AGE_MS {
+        return false;
+    }
+    if now.saturating_sub(bnc.timestamp_ms) > MAX_PRICE_AGE_MS {
+        return false;
+    }
+
+    // Захист від битих даних
+    if mexc.bid <= 0.0 || mexc.ask <= 0.0 || bnc.bid <= 0.0 || bnc.ask <= 0.0 {
+        return false;
+    }
+
+    let min_spread = cfg.trading.min_spread_pct;
+
+    // MEXC внутрішній spread (між його власними bid і ask).
+    // Якщо він великий — на MEXC погана ліквідність, арбітраж може бути ілюзорним.
+    let mexc_internal = (mexc.ask - mexc.bid) / mexc.bid * 100.0;
+
+    // LONG напрямок: MEXC дешевше Binance. Купуємо MEXC по ask.
+    let long_arb = (bnc.bid - mexc.ask) / mexc.ask * 100.0;
+
+    // SHORT напрямок: MEXC дорожче Binance. Продаємо MEXC по bid.
+    let short_arb = (mexc.bid - bnc.ask) / bnc.ask * 100.0;
+
+    // ЧИСТИЙ очікуваний прибуток = арбітражний спред МІНУС внутрішній MEXC spread.
+    // Це фільтрує "псевдо-сигнали" коли MEXC має широкий book і арбітраж ілюзорний.
+    let long_net = long_arb - mexc_internal;
+    let short_net = short_arb - mexc_internal;
+
+    // Обираємо сторону за ЧИСТИМ профітом
+    let (side, entry_price, mexc_top_qty, direction_label, spread_pct, arb_pct) =
+        if long_net >= min_spread && long_net >= short_net {
+            (SIDE_OPEN_LONG, mexc.ask, top_ask_qty(state, sym), "LONG", long_net, long_arb)
+        } else if short_net >= min_spread {
+            (SIDE_OPEN_SHORT, mexc.bid, top_bid_qty(state, sym), "SHORT", short_net, short_arb)
+        } else {
+            return false;
+        };
+
+    // Розрахунок vol (контракти)
+    let csize = contract_size(sym);
+    let desired_vol = (cfg.trading.size_usdt / entry_price / csize).floor() as i64;
+
+    // Викуп тільки першого bid/ask: vol обмежений top-of-book.
+    // Беремо МАКСИМУМ 70% від top — за 150-200мс HTTP ринок встигає рухнутись,
+    // маркетмейкери прибирають ліквідність. 70% дає простір для гарантованого
+    // виконання по top-of-book ціні без slippage у 2-й рівень.
+    let top_qty_int = mexc_top_qty.floor() as i64;
+    let safe_top = (top_qty_int as f64 * 0.7) as i64;
+    let vol = desired_vol.min(safe_top);
+
+    if vol < 1 {
+        return false;
+    }
+
+    let lev = leverage(sym);
+    let mexc_sym = if sym.contains('_') { sym.to_string() } else { sym.replace("USDT", "_USDT") };
+
+    // DRY_RUN: тільки логуємо, не торгуємо
+    let dry_run = std::env::var("DRY_RUN").map(|v| v == "1").unwrap_or(false);
+    if dry_run {
+        info!(target: "strategy",
+              "🔵 DRY {} {} vol={} entry={} net={:.4}% (arb={:.4}% mexc_in={:.4}%)",
+              direction_label, sym, vol, entry_price, spread_pct, arb_pct, mexc_internal);
+        // Ставимо cooldown щоб не спамити логами
+        state.cooldown_until_ms.store(now_ms() + 3000, Ordering::Relaxed);
+        return false;
+    }
+
+    // ВИКЛИК ОРДЕРА — найдорожче. Все що було до — синхронне, мікросекунди.
+    let t_send = now_ms();
+    let result = http.open_order(&mexc_sym, side, vol as f64, lev).await;
+    let elapsed = now_ms().saturating_sub(t_send);
+
+    match result {
+        Ok(resp) => {
+            // Витягуємо orderId з відповіді MEXC
+            let order_id = resp
+                .get("data")
+                .and_then(|d| d.as_str())
+                .or_else(|| resp.get("data").and_then(|d| d.get("orderId")).and_then(|o| o.as_str()))
+                .unwrap_or("")
+                .to_string();
+
+            let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+            let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+
+            if !success || code != 0 {
+                warn!(target: "strategy",
+                      "open_order rejected: sym={} side={} vol={} resp={}",
+                      sym, side, vol, resp);
+                return false;
+            }
+
+            info!(target: "strategy",
+                  "🟢 OPEN {} {} vol={} entry={} net={:.4}% (arb={:.4}% mexc_in={:.4}%) http={}ms oid={}",
+                  direction_label, sym, vol, entry_price, spread_pct, arb_pct, mexc_internal, elapsed, order_id);
+
+            // Записуємо trade у state.
+            // position_id поки невідомий — підхопиться з ws_private (PnL fix через WS).
+            // А поки що ставимо 0 і будемо звертатись до get_positions якщо треба закрити по REST.
+            let trade = Trade {
+                id: order_id.clone(),
+                symbol: sym.to_string(),
+                side: direction_label.to_string(),
+                entry_price,
+                exit_price: 0.0,
+                size: vol as f64,
+                pnl: 0.0,
+                status: "OPEN".to_string(),
+                close_order_id: String::new(),
+                position_id: 0,
+                open_time_ms: now_ms(),
+                close_time_ms: 0,
+                spread_at_entry: spread_pct,
+            };
+            *state.open_trade.write() = Some(trade);
+
+            true
+        }
+        Err(e) => {
+            warn!(target: "strategy", "open_order failed for {}: {} ({}ms)", sym, e, elapsed);
+            false
+        }
+    }
+}
+
+/// Top ask quantity з orderbook (зчитуємо з RwLock<OrderBook>).
+#[inline]
+fn top_ask_qty(state: &Arc<State>, sym: &str) -> f64 {
+    state
+        .mexc_books
+        .get(sym)
+        .and_then(|book| book.read().best_ask().map(|(_, q)| q))
+        .unwrap_or(0.0)
+}
+
+#[inline]
+fn top_bid_qty(state: &Arc<State>, sym: &str) -> f64 {
+    state
+        .mexc_books
+        .get(sym)
+        .and_then(|book| book.read().best_bid().map(|(_, q)| q))
+        .unwrap_or(0.0)
+}

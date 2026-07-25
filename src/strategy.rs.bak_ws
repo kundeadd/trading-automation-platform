@@ -1,0 +1,431 @@
+//! Стратегія: підписується на broadcast price_updates, реагує миттєво.
+//! Hot path — мінімум алокацій, мінімум логів до виклику open_order.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use tokio::sync::broadcast::error::RecvError;
+use tracing::{info, warn};
+
+use crate::config::{contract_size, leverage, Config};
+use crate::mexc::http::MexcClient;
+use crate::state::{now_ms, State, Trade};
+
+/// Максимальний age (мс) для свіжості ціни. Старіше — пропускаємо.
+const MAX_PRICE_AGE_MS: u64 = 500;
+
+/// Cooldown після закриття позиції (мс) — щоб не зайти миттєво на тих самих даних.
+const COOLDOWN_MS: u64 = 1000;
+const SYMBOL_COOLDOWN_MS: u64 = 10_000; // 10 сек per-symbol cooldown
+
+/// Slippage buffer для limit IOC (% від ціни).
+/// 0.0002 = 0.02% — даємо MEXC простір на цей slippage, далі CANCEL.
+const SLIPPAGE_BUFFER_PCT: f64 = 0.0008;
+
+/// Tick size (мінімальний крок ціни) для кожного символу.
+/// MEXC reject ордера якщо ціна не є кратною tick_size.
+fn tick_size(symbol: &str) -> f64 {
+    match symbol {
+        "TAOUSDT" | "TAO_USDT" => 0.01,
+        "ASTERUSDT" | "ASTER_USDT" => 0.0001,
+        "PENGUUSDT" | "PENGU_USDT" => 0.000001,
+        "ZECUSDT" | "ZEC_USDT" => 0.01,
+        "ENAUSDT" | "ENA_USDT" => 0.00001,
+        "NVDAUSDT" | "NVIDIA_USDT" => 0.01,
+        "BCHUSDT" | "BCH_USDT" => 0.01,
+        "LINKUSDT" | "LINK_USDT" => 0.001,
+        "HYPEUSDT" | "HYPE_USDT" => 0.001,
+        "UNIUSDT" | "UNI_USDT" => 0.001,
+        "XLMUSDT" | "XLM_USDT" => 0.00001,
+        "HBARUSDT" | "HBAR_USDT" => 0.00001,
+        _ => 0.01,
+    }
+}
+
+fn min_spread_for(symbol: &str) -> f64 {
+    match symbol {
+        "ASTERUSDT" | "ASTER_USDT" => 999.0,
+        "ZECUSDT" | "ZEC_USDT" => 999.0,
+        _ => 0.10,
+    }
+}
+
+fn buffer_for(_symbol: &str) -> f64 {
+    0.0006
+}
+
+/// Округлити ціну до tick_size з потрібним напрямком:
+/// - LONG (buy): округлюємо ВГОРУ — щоб точно купити (можемо переплатити tick)
+/// - SHORT (sell): округлюємо ВНИЗ — щоб точно продати (можемо недоотримати tick)
+#[inline]
+fn round_price(price: f64, tick: f64, round_up: bool) -> f64 {
+    if round_up {
+        (price / tick).ceil() * tick
+    } else {
+        (price / tick).floor() * tick
+    }
+}
+
+/// MEXC side codes (з http.rs):
+/// 1 = open LONG, 3 = open SHORT
+const SIDE_OPEN_LONG: i32 = 1;
+const SIDE_OPEN_SHORT: i32 = 3;
+
+pub async fn run_strategy(cfg: Arc<Config>, state: Arc<State>, http: MexcClient) {
+    let mut rx = state.price_updates.subscribe();
+    info!(target: "strategy", "started, min_spread={}%, size={} USDT",
+          cfg.trading.min_spread_pct, cfg.trading.size_usdt);
+
+    loop {
+        // Чекаємо тригер. RecvError::Lagged — це коли broadcast пропустив повідомлення
+        // (стратегія повільніша за push). Просто продовжуємо — стан state вже актуальний.
+        match rx.recv().await {
+            Ok(()) => {}
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => {
+                warn!(target: "strategy", "price_updates closed, exiting");
+                return;
+            }
+        }
+
+        // Hot path. Намагаємось бути максимально швидкими.
+        check_and_trade(&cfg, &state, &http).await;
+    }
+}
+
+#[inline]
+async fn check_and_trade(cfg: &Config, state: &Arc<State>, http: &MexcClient) {
+    // 1. Уже є відкрита позиція? — пропускаємо
+    if state.open_trade.read().is_some() {
+        return;
+    }
+
+    // 2. Cooldown
+    let now = now_ms();
+    let cd_until = state.cooldown_until_ms.load(Ordering::Relaxed);
+    if now < cd_until {
+        return;
+    }
+
+    // 3. Перевіряємо кожен символ. Якщо знайшли сигнал — відкриваємо і виходимо
+    //    (не дозволяємо одночасно дві позиції в одному тіку).
+    for sym in &cfg.trading.symbols {
+        if try_signal(cfg, state, http, sym, now).await {
+            return;
+        }
+    }
+}
+
+/// Повертає true якщо позиція відкрита.
+async fn try_signal(
+    cfg: &Config,
+    state: &Arc<State>,
+    http: &MexcClient,
+    sym: &str,
+    now: u64,
+) -> bool {
+    // Атомарне читання обох цін з DashMap
+    let mexc = match state.mexc_prices.get(sym) {
+        Some(p) => *p,
+        None => return false,
+    };
+    let bnc = match state.binance_prices.get(sym) {
+        Some(p) => *p,
+        None => return false,
+    };
+
+    // Свіжість
+    if now.saturating_sub(mexc.timestamp_ms) > MAX_PRICE_AGE_MS {
+        return false;
+    }
+    // Per-symbol cooldown
+    if let Some(cd) = state.symbol_cooldown.get(sym) {
+        if now < *cd {
+            return false;
+        }
+    }
+    if now.saturating_sub(bnc.timestamp_ms) > MAX_PRICE_AGE_MS {
+        return false;
+    }
+
+    // Захист від битих даних
+    if mexc.bid <= 0.0 || mexc.ask <= 0.0 || bnc.bid <= 0.0 || bnc.ask <= 0.0 {
+        return false;
+    }
+
+    let min_spread = min_spread_for(sym);
+
+    // MEXC внутрішній spread (між його власними bid і ask).
+    // Якщо він великий — на MEXC погана ліквідність, арбітраж може бути ілюзорним.
+    let mexc_internal = (mexc.ask - mexc.bid) / mexc.bid * 100.0;
+
+    // LONG напрямок: MEXC дешевше Binance. Купуємо MEXC по ask.
+    let long_arb = (bnc.bid - mexc.ask) / mexc.ask * 100.0;
+
+    // SHORT напрямок: MEXC дорожче Binance. Продаємо MEXC по bid.
+    let short_arb = (mexc.bid - bnc.ask) / bnc.ask * 100.0;
+
+    // ЧИСТИЙ очікуваний прибуток = арбітражний спред МІНУС внутрішній MEXC spread.
+    // Це фільтрує "псевдо-сигнали" коли MEXC має широкий book і арбітраж ілюзорний.
+    let long_net = long_arb - mexc_internal;
+    let short_net = short_arb - mexc_internal;
+
+    // Обираємо сторону за ЧИСТИМ профітом
+    let (side, entry_price, mexc_top_qty, direction_label, spread_pct, arb_pct) =
+        if long_net >= min_spread && long_net >= short_net {
+            (SIDE_OPEN_LONG, mexc.ask, top_ask_qty(state, sym), "LONG", long_net, long_arb)
+        } else if short_net >= min_spread {
+            (SIDE_OPEN_SHORT, mexc.bid, top_bid_qty(state, sym), "SHORT", short_net, short_arb)
+        } else {
+            return false;
+        };
+
+    // Розрахунок vol (контракти).
+    // Per-symbol size: TAO 2000 USDT, ASTER 1000 USDT, інші — з конфігу.
+    let csize = contract_size(sym);
+    let symbol_size = match sym {
+        "TAOUSDT" | "TAO_USDT" => 2000.0,
+        "ASTERUSDT" | "ASTER_USDT" => 1000.0,
+        "PENGUUSDT" | "PENGU_USDT" => 1500.0,
+        "ZECUSDT" | "ZEC_USDT" => 1500.0,
+        "ENAUSDT" | "ENA_USDT" => 1500.0,
+        "NVDAUSDT" | "NVIDIA_USDT" => 1500.0,
+        "BCHUSDT" | "BCH_USDT" => 1500.0,
+        "LINKUSDT" | "LINK_USDT" => 1500.0,
+        "HYPEUSDT" | "HYPE_USDT" => 1500.0,
+        "UNIUSDT" | "UNI_USDT" => 1500.0,
+        "XLMUSDT" | "XLM_USDT" => 1500.0,
+        "HBARUSDT" | "HBAR_USDT" => 1500.0,
+        _ => cfg.trading.size_usdt,
+    };
+    let desired_vol = (symbol_size / entry_price / csize).floor() as i64;
+
+    // Викуп тільки першого bid/ask: vol обмежений top-of-book.
+    // Беремо МАКСИМУМ 70% від top — за 150-200мс HTTP ринок встигає рухнутись,
+    // маркетмейкери прибирають ліквідність. 70% дає простір для гарантованого
+    // виконання по top-of-book ціні без slippage у 2-й рівень.
+    let top_qty_int = mexc_top_qty.floor() as i64;
+    let safe_top = (top_qty_int as f64 * 0.7) as i64;
+    let vol = desired_vol.min(safe_top);
+
+    if vol < 1 {
+        return false;
+    }
+
+    let lev = leverage(sym);
+    let mexc_sym = if sym.contains('_') { sym.to_string() } else { sym.replace("USDT", "_USDT") };
+
+    // DRY_RUN: тільки логуємо, не торгуємо
+    let dry_run = std::env::var("DRY_RUN").map(|v| v == "1").unwrap_or(false);
+    if dry_run {
+        info!(target: "strategy",
+              "🔵 DRY {} {} vol={} entry={} net={:.4}% (arb={:.4}% mexc_in={:.4}%)",
+              direction_label, sym, vol, entry_price, spread_pct, arb_pct, mexc_internal);
+        // Ставимо cooldown щоб не спамити логами
+        state.cooldown_until_ms.store(now_ms() + 3000, Ordering::Relaxed);
+        return false;
+    }
+
+    // Розрахунок limit-price з slippage buffer:
+    // LONG: купуємо MEXC по ask. Допустима максимальна ціна = ask × (1 + buffer)
+    // SHORT: продаємо MEXC по bid. Допустима мінімальна ціна = bid × (1 - buffer)
+    let raw_limit = if side == SIDE_OPEN_LONG {
+        entry_price * (1.0 + buffer_for(sym))
+    } else {
+        entry_price * (1.0 - buffer_for(sym))
+    };
+    // Округлюємо до tick_size — MEXC reject ордера якщо точність неправильна.
+    let tick = tick_size(sym);
+    let limit_price = round_price(raw_limit, tick, side == SIDE_OPEN_LONG);
+
+    // ВИКЛИК ОРДЕРА — limit IOC.
+    // Якщо ринок втік далі buffer — MEXC скасує (повернеться 0 vol/error).
+    let t_send = now_ms();
+    let result = http.open_order_limit(&mexc_sym, side, vol as f64, lev, limit_price).await;
+    let elapsed = now_ms().saturating_sub(t_send);
+
+    match result {
+        Ok(resp) => {
+            // Витягуємо orderId з відповіді MEXC
+            let order_id = resp
+                .get("data")
+                .and_then(|d| d.as_str())
+                .or_else(|| resp.get("data").and_then(|d| d.get("orderId")).and_then(|o| o.as_str()))
+                .unwrap_or("")
+                .to_string();
+
+            let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+            let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+
+            if !success || code != 0 {
+                warn!(target: "strategy",
+                      "open_order rejected: sym={} side={} vol={} resp={}",
+                      sym, side, vol, resp);
+                return false;
+            }
+
+            info!(target: "strategy",
+                  "🟢 OPEN {} {} vol={} entry={} net={:.4}% (arb={:.4}% mexc_in={:.4}%) http={}ms oid={}",
+                  direction_label, sym, vol, entry_price, spread_pct, arb_pct, mexc_internal, elapsed, order_id);
+
+            // Записуємо trade у state.
+            // position_id поки невідомий — підхопиться з ws_private (PnL fix через WS).
+            // А поки що ставимо 0 і будемо звертатись до get_positions якщо треба закрити по REST.
+            let trade = Trade {
+                id: order_id.clone(),
+                symbol: sym.to_string(),
+                side: direction_label.to_string(),
+                entry_price,
+                exit_price: 0.0,
+                size: vol as f64,
+                pnl: 0.0,
+                status: "OPEN".to_string(),
+                close_order_id: String::new(),
+                position_id: 0,
+                open_time_ms: now_ms(),
+                close_time_ms: 0,
+                spread_at_entry: spread_pct,
+                stop_armed: false,
+                open_http_ms: elapsed,
+                close_reason: String::new(),
+            };
+            *state.open_trade.write() = Some(trade);
+            // Per-symbol cooldown — не відкривати по цьому символу 10 сек
+            state.symbol_cooldown.insert(sym.to_string(), now_ms() + SYMBOL_COOLDOWN_MS);
+
+            // ФОНОВА ПЕРЕВІРКА: через 1.5с перевіряємо що limit IOC реально виконався.
+            // Якщо позиції немає — limit зависнув як GTC, скасовуємо.
+            // Це не блокує strategy — просто захист "на всяк випадок".
+            let oid_check = order_id.clone();
+            let sym_check = mexc_sym.clone();
+            let http_check = http.clone();
+            let state_check = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                // Перевіряємо реальну позицію через REST
+                let pos_resp = match http_check.get_positions(Some(&sym_check)).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let has_position = pos_resp.get("data")
+                    .and_then(|d| d.as_array())
+                    .map(|arr| arr.iter().any(|p| {
+                        p.get("holdVol").and_then(|v| v.as_f64()).unwrap_or(0.0) > 0.0
+                    }))
+                    .unwrap_or(false);
+
+                if !has_position {
+                    // Перевіряємо що trade ще в state і не закритий monitor-ом
+                    let still_open = {
+                        let t = state_check.open_trade.read();
+                        t.as_ref().map(|tr| tr.id == oid_check).unwrap_or(false)
+                    };
+                    if !still_open {
+                        // Позиція вже закрита monitor-ом — всё нормально
+                        return;
+                    }
+                    // Позиції немає і trade ще в state — limit IOC завис. Скасовуємо.
+                    warn!(target: "strategy", "limit order didn't fill, cancelling oid={}", oid_check);
+                    let _ = http_check.cancel_order(&oid_check).await;
+                    // Чистимо state — щоб monitor не намагався закрити неіснуючу позицію
+                    let mut t = state_check.open_trade.write();
+                    if let Some(ref tr) = *t {
+                        if tr.id == oid_check {
+                            *t = None;
+                            // Cooldown щоб не зайти миттєво
+                            state_check.cooldown_until_ms.store(now_ms() + COOLDOWN_MS, Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    // Позиція є — беремо реальну ціну філлу з REST
+                    let real_price = pos_resp.get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|arr| arr.iter().find(|p| {
+                            p.get("holdVol").and_then(|v| v.as_f64()).unwrap_or(0.0) > 0.0
+                        }))
+                        .and_then(|p| {
+                            p.get("openAvgPrice")
+                                .or_else(|| p.get("avgPrice"))
+                                .or_else(|| p.get("holdAvgPrice"))
+                                .or_else(|| p.get("entryPrice"))
+                        })
+                        .and_then(|v| v.as_f64())
+                        .filter(|&p| p > 0.0);
+
+                    if let Some(real_entry) = real_price {
+                        let (trade_side, trade_size, trade_sym) = {
+                            let mut t = state_check.open_trade.write();
+                            if let Some(ref mut tr) = *t {
+                                if tr.id == oid_check {
+                                    info!(target: "strategy",
+                                          "✅ entry_price updated: orderbook={:.6} real={:.6} diff={:.4}%",
+                                          tr.entry_price,
+                                          real_entry,
+                                          (real_entry - tr.entry_price).abs() / tr.entry_price * 100.0);
+                                    tr.entry_price = real_entry;
+                                    tr.stop_armed = true;
+                                    (tr.side.clone(), tr.size, tr.symbol.clone())
+                                } else {
+                                    return;
+                                }
+                            } else {
+                                return;
+                            }
+                        };
+                        // Виставляємо план-ордер на закриття в БУ (break-even)
+                        let plan_side = if trade_side == "LONG" { 3i32 } else { 4i32 };
+                        let mexc_sym_plan = if trade_sym.contains('_') { trade_sym.clone() } else { trade_sym.replace("USDT", "_USDT") };
+                        match http_check.place_stop_plan_order(&mexc_sym_plan, plan_side, trade_size, real_entry, 0.0).await {
+                            Ok(resp) => {
+                                let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                                let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+                                if success && code == 0 {
+                                    info!(target: "strategy", "✅ BE stop placed: {} {} trigger={:.6}", trade_side, trade_sym, real_entry);
+                                } else {
+                                    warn!(target: "strategy", "BE stop rejected: {} resp={}", trade_sym, resp);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(target: "strategy", "BE stop failed: {} {}", trade_sym, e);
+                            }
+                        }
+                    } else {
+                        // Не змогли розпарсити ціну — збройнюємо стоп по orderbook ціні
+                        warn!(target: "strategy", "real entry price not found in REST, arming stop on orderbook price oid={}", oid_check);
+                        let mut t = state_check.open_trade.write();
+                        if let Some(ref mut tr) = *t {
+                            if tr.id == oid_check {
+                                tr.stop_armed = true;
+                            }
+                        }
+                    }
+                }
+            });
+
+            true
+        }
+        Err(e) => {
+            warn!(target: "strategy", "open_order failed for {}: {} ({}ms)", sym, e, elapsed);
+            false
+        }
+    }
+}
+
+/// Top ask quantity з orderbook (зчитуємо з RwLock<OrderBook>).
+#[inline]
+fn top_ask_qty(state: &Arc<State>, sym: &str) -> f64 {
+    state
+        .mexc_books
+        .get(sym)
+        .and_then(|book| book.read().best_ask().map(|(_, q)| q))
+        .unwrap_or(0.0)
+}
+
+#[inline]
+fn top_bid_qty(state: &Arc<State>, sym: &str) -> f64 {
+    state
+        .mexc_books
+        .get(sym)
+        .and_then(|book| book.read().best_bid().map(|(_, q)| q))
+        .unwrap_or(0.0)
+}

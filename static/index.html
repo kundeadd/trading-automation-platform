@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ARB BOT</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0c0e12;--bg2:#131720;--bg3:#1a1f2e;--bg4:#212840;
+  --border:rgba(255,255,255,0.06);--border2:rgba(255,255,255,0.11);
+  --text:#dde1f0;--muted:#5a6080;--muted2:#8892b0;
+  --green:#00e676;--green-d:rgba(0,230,118,0.1);
+  --red:#ff5370;--red-d:rgba(255,83,112,0.1);
+  --blue:#82aaff;--blue-d:rgba(130,170,255,0.1);
+  --amber:#ffcb6b;--amber-d:rgba(255,203,107,0.1);
+  --violet:#c792ea;--violet-d:rgba(199,146,234,0.1);
+  --mono:'IBM Plex Mono',monospace;
+  --sans:'IBM Plex Sans',sans-serif;
+}
+body{background:#0c0e12;color:#dde1f0;font-family:var(--mono);font-size:13px;min-height:100vh}
+
+/* ── LAYOUT ── */
+.shell{display:grid;grid-template-columns:220px 1fr;grid-template-rows:52px 1fr;height:100vh;overflow:hidden}
+header{grid-column:1/-1;background:#131720;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px;flex-shrink:0}
+aside{background:#131720;border-right:1px solid rgba(255,255,255,0.06);display:flex;flex-direction:column;overflow-y:auto;padding:16px 0}
+main{overflow-y:auto;background:#0c0e12}
+.page{display:none;padding:20px}
+.page.active{display:block}
+
+/* ── HEADER ── */
+.logo{font-family:var(--sans);font-size:14px;font-weight:600;letter-spacing:.05em;display:flex;align-items:center;gap:8px}
+.logo-sep{color:#5a6080;font-size:11px}
+.hdr-right{display:flex;align-items:center;gap:16px}
+.ws-pill{display:flex;align-items:center;gap:5px;font-size:11px;color:#8892b0;padding:4px 10px;background:#1a1f2e;border-radius:20px;border:1px solid var(--border)}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.dot.ok{background:var(--green);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── SIDEBAR ── */
+.sidebar-section{padding:0 12px;margin-bottom:20px}
+.sidebar-label{font-size:9px;letter-spacing:.12em;color:#5a6080;text-transform:uppercase;padding:0 8px;margin-bottom:5px}
+.nav-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;cursor:pointer;color:#8892b0;font-size:12px;transition:all .12s;border:1px solid transparent;font-family:'IBM Plex Mono',monospace}
+.nav-item:hover{background:#1a1f2e;color:#dde1f0}
+.nav-item.active{background:var(--violet-d);color:var(--violet);border-color:rgba(199,146,234,.2)}
+.nav-icon{width:16px;text-align:center;font-size:12px}
+
+/* ── BOT TOGGLE ── */
+.bot-block{margin:0 12px 20px;background:#1a1f2e;border:1px solid var(--border);border-radius:10px;padding:14px}
+.bot-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.bot-lbl{font-size:10px;color:#8892b0}
+.pill{font-size:9px;font-weight:600;padding:2px 8px;border-radius:20px;letter-spacing:.06em}
+.pill.run{background:var(--green-d);color:var(--green);border:1px solid rgba(0,230,118,.25)}
+.pill.stop{background:var(--red-d);color:var(--red);border:1px solid rgba(255,83,112,.25)}
+.btn-run{width:100%;padding:8px;border-radius:7px;font-family:var(--mono);font-size:11px;font-weight:500;cursor:pointer;transition:all .15s;border:1px solid rgba(199,146,234,.3);background:var(--violet-d);color:var(--violet);letter-spacing:.04em}
+.btn-run:hover{background:rgba(199,146,234,.18)}
+.btn-run.running{background:var(--red-d);color:var(--red);border-color:rgba(255,83,112,.3)}
+
+/* ── STAT GRID ── */
+.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+.stat{background:#131720;border:1px solid var(--border);border-radius:10px;padding:14px 16px;position:relative;overflow:hidden}
+.stat::after{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.stat.g::after{background:var(--green)}
+.stat.b::after{background:var(--blue)}
+.stat.a::after{background:var(--amber)}
+.stat.v::after{background:var(--violet)}
+.stat-lbl{font-size:9px;color:#5a6080;letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px}
+.stat-val{font-size:20px;font-weight:600;line-height:1}
+.stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.b{color:var(--blue)}.stat-val.a{color:var(--amber)}.stat-val.v{color:var(--violet)}
+.stat-sub{font-size:10px;color:#5a6080;margin-top:5px}
+
+/* ── ACCOUNT SLOTS ── */
+.slots-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:24px}
+.slot{background:#131720;border:1px solid var(--border);border-radius:12px;overflow:hidden;transition:border-color .15s}
+.slot.active-trade{border-color:rgba(0,230,118,.3)}
+.slot.disabled{opacity:.5}
+.slot-head{padding:12px 14px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.slot-name{font-size:12px;font-weight:500;color:#dde1f0}
+.slot-sym{font-size:11px;color:var(--violet);font-weight:600}
+.slot-body{padding:12px 14px}
+.slot-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:11px}
+.slot-row-lbl{color:#8892b0}
+.slot-row-val{font-weight:500}
+.slot-row-val.g{color:var(--green)}.slot-row-val.r{color:var(--red)}.slot-row-val.b{color:var(--blue)}
+.slot-spread{margin-top:8px;padding:8px 10px;background:#1a1f2e;border-radius:7px;font-size:11px;display:flex;justify-content:space-between;align-items:center}
+.slot-spread-lbl{color:#5a6080}
+.slot-status-bar{padding:8px 14px;background:#1a1f2e;font-size:10px;display:flex;align-items:center;gap:6px}
+.opening-badge{background:rgba(255,170,0,.15);color:#ffaa00;border:1px solid rgba(255,170,0,.3);padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.in-trade-badge{background:var(--green-d);color:var(--green);border:1px solid rgba(0,230,118,.2);padding:2px 8px;border-radius:20px;font-size:9px;font-weight:600}
+.no-key-badge{background:var(--amber-d);color:var(--amber);border:1px solid rgba(255,203,107,.2);padding:2px 8px;border-radius:20px;font-size:9px}
+.ready-badge{background:var(--blue-d);color:var(--blue);border:1px solid rgba(130,170,255,.2);padding:2px 8px;border-radius:20px;font-size:9px}
+.blocked-badge{background:rgba(255,80,80,.15);color:#ff6b6b;border:1px solid rgba(255,80,80,.35);padding:2px 8px;border-radius:20px;font-size:9px;font-weight:600}
+.unblock-btn{background:transparent;color:#ff6b6b;border:1px solid rgba(255,80,80,.4);padding:2px 8px;border-radius:4px;font-size:9px;cursor:pointer;margin-left:6px}
+.unblock-btn:hover{background:rgba(255,80,80,.1)}
+
+/* ── SPREAD TABLE ── */
+.section-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.section-title{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#5a6080}
+.badge{font-size:10px;padding:2px 8px;border-radius:20px;background:#1a1f2e;color:#8892b0;border:1px solid var(--border)}
+.table-wrap{background:#131720;border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:20px}
+table{width:100%;border-collapse:collapse}
+thead th{padding:9px 13px;text-align:left;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:#5a6080;background:#1a1f2e;border-bottom:1px solid var(--border)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:#1a1f2e}
+td{padding:8px 13px;font-size:12px}
+.sym{font-weight:600;color:#dde1f0}
+.price{color:#8892b0;font-size:11px}
+.sprd-pos{color:var(--green);font-weight:600}
+.sprd-neg{color:var(--red);font-weight:600}
+.dir{font-size:9px;padding:2px 7px;border-radius:4px;font-weight:600;letter-spacing:.04em}
+.dir.buy{background:var(--green-d);color:var(--green)}
+.dir.sell{background:var(--red-d);color:var(--red)}
+.bar-cell{width:100px}
+.bar-wrap{display:flex;align-items:center;gap:6px}
+.bar{flex:1;height:3px;background:#1a1f2e;border-radius:2px;overflow:hidden}
+.bar-fill{height:100%;border-radius:2px;transition:width .2s}
+.bar-fill.pos{background:var(--green)}.bar-fill.neg{background:var(--red)}
+.flash-g{animation:fG .35s}.flash-r{animation:fR .35s}
+@keyframes fG{0%{background:rgba(0,230,118,.15)}100%{background:transparent}}
+@keyframes fR{0%{background:rgba(255,83,112,.15)}100%{background:transparent}}
+
+/* ── TRADES ── */
+.trade-item{display:flex;align-items:center;gap:10px;padding:8px 13px;border-bottom:1px solid var(--border);font-size:11px}
+.trade-item:last-child{border-bottom:none}
+.t-side{font-size:9px;font-weight:600;padding:2px 7px;border-radius:4px;min-width:34px;text-align:center;letter-spacing:.04em}
+.t-side.BUY{background:var(--green-d);color:var(--green)}
+.t-side.SELL{background:var(--red-d);color:var(--red)}
+.t-acc{color:var(--violet);min-width:80px;font-size:10px}
+.t-sym{font-weight:600;min-width:80px}
+.t-price{color:#8892b0;flex:1}
+.t-pnl{font-weight:600;min-width:75px;text-align:right}
+.t-pnl.pos{color:var(--green)}.t-pnl.neg{color:var(--red)}
+.t-time{color:#5a6080;font-size:10px;min-width:60px;text-align:right}
+
+/* ── SETTINGS ── */
+.settings-layout{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.cfg-card{background:#131720;border:1px solid var(--border);border-radius:10px;padding:16px}
+.cfg-title{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#5a6080;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.cfg-title span{color:var(--violet)}
+.form-row{margin-bottom:11px}
+.form-lbl{font-size:10px;color:#8892b0;display:block;margin-bottom:4px}
+.form-input{width:100%;background:#1a1f2e;border:1px solid var(--border2);border-radius:6px;color:#dde1f0;font-family:var(--mono);font-size:12px;padding:7px 9px;outline:none;transition:border-color .15s}
+.form-input:focus{border-color:rgba(199,146,234,.45)}
+select.form-input{cursor:pointer}
+.form-row-inline{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px}
+.toggle{position:relative;width:34px;height:18px}
+.toggle input{display:none}
+.tslider{position:absolute;inset:0;background:#1a1f2e;border:1px solid var(--border2);border-radius:18px;cursor:pointer;transition:all .2s}
+.tslider::after{content:'';position:absolute;top:3px;left:3px;width:10px;height:10px;background:var(--muted);border-radius:50%;transition:all .2s}
+.toggle input:checked+.tslider{background:var(--violet-d);border-color:rgba(199,146,234,.4)}
+.toggle input:checked+.tslider::after{transform:translateX(16px);background:var(--violet)}
+.btn-save{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;background:var(--violet-d);color:var(--violet);border:1px solid rgba(199,146,234,.3);border-radius:7px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:all .15s;margin-top:4px}
+.btn-save:hover{background:rgba(199,146,234,.2)}
+.btn-reset{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;background:transparent;color:#8a8f9f;border:1px solid #2a2e38;border-radius:7px;font-family:var(--mono);font-size:10px;cursor:pointer;transition:all .15s;margin-top:4px;margin-left:8px}
+.btn-reset:hover{background:rgba(255,100,100,.08);color:#c87070;border-color:rgba(255,100,100,.3)}
+.rules-table{width:100%;border-collapse:collapse;margin-top:6px;font-size:10px}
+.rules-table th{text-align:left;color:#8a8f9f;font-weight:500;padding:4px 6px;border-bottom:1px solid var(--border);font-size:9px;text-transform:uppercase;letter-spacing:.05em}
+.rules-table td{padding:3px 4px;border-bottom:1px solid #1a1e27}
+.rules-table input{width:100%;background:#0f1218;border:1px solid #2a2e38;color:#d4d7dd;padding:4px 6px;border-radius:4px;font-family:var(--mono);font-size:10px}
+.rules-table input:focus{outline:none;border-color:var(--violet)}
+.rules-table .rm-btn{background:transparent;border:1px solid #2a2e38;color:#8a8f9f;width:24px;height:24px;border-radius:4px;cursor:pointer;font-size:12px;padding:0}
+.rules-table .rm-btn:hover{background:rgba(255,100,100,.1);color:#c87070;border-color:rgba(255,100,100,.3)}
+.btn-add-rule{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;background:transparent;color:var(--violet);border:1px dashed rgba(199,146,234,.3);border-radius:6px;font-family:var(--mono);font-size:10px;cursor:pointer;margin-top:6px}
+.btn-add-rule:hover{background:rgba(199,146,234,.08);border-style:solid}
+.sym-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:4px}
+.sym-chk{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#0f1218;border:1px solid #2a2e38;border-radius:6px;cursor:pointer;font-size:10px;font-family:var(--mono);user-select:none}
+.sym-chk:hover{border-color:var(--violet)}
+.sym-chk input{margin:0;accent-color:var(--violet)}
+.sym-chk.checked{background:rgba(199,146,234,.08);border-color:var(--violet);color:var(--violet)}
+.save-ok{font-size:11px;color:var(--green);margin-left:10px;display:none}
+
+/* ── LOG ── */
+.log-wrap{background:#131720;border:1px solid var(--border);border-radius:10px;overflow:hidden;max-height:70vh;overflow-y:auto}
+.log-line{display:flex;gap:10px;padding:6px 13px;border-bottom:1px solid var(--border);font-size:11px;line-height:1.5}
+.log-line:last-child{border-bottom:none}
+.log-t{color:#5a6080;min-width:70px}
+.log-m.info{color:#8892b0}.log-m.success{color:var(--green)}.log-m.warn{color:var(--amber)}.log-m.error{color:var(--red)}
+
+/* ── EMPTY ── */
+.empty{text-align:center;padding:32px 20px;color:#5a6080;font-size:12px}
+
+.accounts-row{display:grid;grid-template-columns:1fr 380px;gap:14px;margin-bottom:24px}
+.slots-grid{margin-bottom:0 !important}
+.accounts-history{background:#161a2b;border:1px solid #232842;border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:8px;max-height:520px;overflow-y:auto}
+.ah-title{color:#7a8298;font-size:10px;text-transform:uppercase;letter-spacing:1px;font-weight:600;padding-bottom:6px;border-bottom:1px solid #232842}
+.ah-list{display:flex;flex-direction:column;gap:5px}
+.ah-item{display:grid;grid-template-columns:50px 60px 1fr auto;gap:8px;align-items:center;padding:7px 9px;background:#1a1f2e;border-radius:6px;font-size:11px}
+.ah-side{font-weight:700;font-size:10px;padding:2px 6px;border-radius:4px;text-align:center}
+.ah-side.LONG,.ah-side.BUY{background:rgba(80,200,120,.15);color:#50c878}
+.ah-side.SHORT,.ah-side.SELL{background:rgba(255,83,112,.15);color:#ff5370}
+.ah-sym{color:#a0a8c0;font-weight:600}
+.ah-spread{color:#7a8298;font-size:10px}
+.ah-pnl{font-weight:700;font-variant-numeric:tabular-nums}
+.ah-pnl.pos{color:#50c878}
+.ah-pnl.neg{color:#ff5370}
+.ah-empty{color:#5a6080;font-size:11px;text-align:center;padding:20px 0}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<!-- HEADER -->
+<header>
+  <div class="logo">
+    <span style="color:var(--violet)">◈</span> ARB BOT
+    <span class="logo-sep">│</span>
+    <span style="color:#8892b0;font-size:11px">BINANCE × MEXC</span>
+  </div>
+  <div class="hdr-right">
+    <div class="ws-pill"><div class="dot" id="dot-bnb"></div><span id="lbl-bnb">Binance</span></div>
+    <div class="ws-pill"><div class="dot" id="dot-mexc"></div><span id="lbl-mexc">MEXC</span></div>
+    <div class="ws-pill"><div class="dot" id="dot-panel"></div><span id="lbl-panel">Panel</span></div>
+  </div>
+</header>
+
+<!-- SIDEBAR -->
+<aside>
+  <div class="bot-block">
+    <div class="bot-hdr">
+      <span class="bot-lbl">Статус</span>
+      <span class="pill stop" id="bot-pill">STOPPED</span>
+    </div>
+    <button class="btn-run" id="btn-run" onclick="toggleBot()">▶ ЗАПУСТИТЬ</button>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-label">Мониторинг</div>
+    <div class="nav-item active" onclick="go('dashboard',this)"><span class="nav-icon">◈</span>Дашборд</div>
+    <div class="nav-item" onclick="go('spreads',this)"><span class="nav-icon">≈</span>Спреды</div>
+    <div class="nav-item" onclick="go('trades',this)"><span class="nav-icon">⇄</span>Сделки</div>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-label">Управление</div>
+    <div class="nav-item" onclick="go('settings',this)"><span class="nav-icon">⚙</span>Аккаунты</div>
+    <div class="nav-item" onclick="go('log',this)"><span class="nav-icon">≡</span>Лог</div>
+  </div>
+
+  <div style="margin-top:auto;padding:0 12px">
+    <div style="background:#1a1f2e;border:1px solid var(--border);border-radius:8px;padding:10px;font-size:10px;color:#5a6080;line-height:1.7">
+      <div style="color:var(--amber);font-size:9px;letter-spacing:.08em;margin-bottom:3px">⚑ LATENCY</div>
+      VPS Tokyo → AWS ap-northeast-1<br>или Hetzner JP для<br>минимального пинга до бирж
+    </div>
+  </div>
+</aside>
+
+<!-- MAIN -->
+<main>
+
+<!-- ── DASHBOARD ── -->
+<div class="page active" id="page-dashboard">
+  <div class="stat-row">
+    <div class="stat g">
+      <div class="stat-lbl">Суммарный PnL</div>
+      <div class="stat-val g" id="s-pnl">$0.00</div>
+      <div class="stat-sub" id="s-pnl-sub">0 сделок</div>
+    </div>
+    <div class="stat b">
+      <div class="stat-lbl">Win Rate</div>
+      <div class="stat-val b" id="s-wr">—</div>
+      <div class="stat-sub" id="s-wr-sub">по всем аккаунтам</div>
+    </div>
+    <div class="stat a">
+      <div class="stat-lbl">Открытых позиций</div>
+      <div class="stat-val a" id="s-open">0</div>
+      <div class="stat-sub" id="s-open-sub">из 3 аккаунтов</div>
+    </div>
+    <div class="stat v">
+      <div class="stat-lbl">Аптайм</div>
+      <div class="stat-val v" id="s-uptime">—</div>
+      <div class="stat-sub">с запуска</div>
+    </div>
+  </div>
+
+  <!-- ACCOUNT SLOTS -->
+  <div class="section-hdr">
+    <div class="section-title">Аккаунты</div>
+    <div class="badge" id="badge-accs">0 активных</div>
+  </div>
+  <div class="accounts-row">
+    <div class="slots-grid" id="slots-grid">
+      <!-- rendered by JS -->
+    </div>
+    <div class="accounts-history" id="accounts-history">
+      <div class="ah-title">История сделок</div>
+      <div class="ah-list" id="ah-list"><div class="ah-empty">Истории ещё нет</div></div>
+    </div>
+  </div>
+
+  <!-- TOP SPREADS -->
+  <div class="section-hdr">
+    <div class="section-title">Спреды по активным монетам</div>
+    <div class="badge" id="badge-sprds">0 пар</div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Монета</th><th>Binance bid</th><th>MEXC ask</th>
+        <th class="bar-cell">Спред</th><th>Направление</th><th>PnL</th>
+      </tr></thead>
+      <tbody id="tb-spreads"><tr><td colspan="6" class="empty">Ожидание данных...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── SPREADS PAGE ── -->
+<div class="page" id="page-spreads">
+  <div class="section-hdr">
+    <div class="section-title">Все спреды в реальном времени</div>
+    <input class="form-input" style="width:150px;padding:4px 9px;font-size:11px" placeholder="Поиск..." id="srch" oninput="renderAllSpreads()">
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Монета</th><th>Binance bid</th><th>Binance ask</th>
+        <th>MEXC bid</th><th>MEXC ask</th><th>Спред %</th><th>Направление</th>
+      </tr></thead>
+      <tbody id="tb-spreads-full"><tr><td colspan="7" class="empty">Ожидание данных...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── TRADES PAGE ── -->
+<div class="page" id="page-trades">
+  <div class="section-hdr">
+    <div class="section-title">Открытые позиции</div>
+    <div class="badge" id="badge-open">0</div>
+  </div>
+  <div class="table-wrap" id="wrap-open" style="margin-bottom:20px">
+    <div class="empty">Нет открытых позиций</div>
+  </div>
+  <div class="section-hdr">
+    <div class="section-title">История сделок</div>
+    <div class="badge" id="badge-hist">0</div>
+  </div>
+  <div class="table-wrap" id="wrap-hist">
+    <div class="empty">История пуста</div>
+  </div>
+</div>
+
+<!-- ── SETTINGS PAGE ── -->
+<div class="page" id="page-settings">
+  <div class="section-hdr" style="margin-bottom:16px">
+    <div class="section-title">Настройки аккаунтов</div>
+  </div>
+  <div class="settings-layout" id="settings-layout">
+    <!-- rendered by JS -->
+  </div>
+</div>
+
+<!-- ── LOG PAGE ── -->
+<div class="page" id="page-log">
+  <div class="section-hdr">
+    <div class="section-title">Системный лог</div>
+    <button onclick="document.getElementById('log-wrap').innerHTML=''" style="font-size:10px;padding:3px 10px;background:#1a1f2e;border:1px solid var(--border);color:#5a6080;border-radius:5px;cursor:pointer;font-family:var(--mono)">Очистить</button>
+  </div>
+  <div class="log-wrap" id="log-wrap">
+    <div class="log-line"><span class="log-t">—</span><span class="log-m info">Ожидание подключения...</span></div>
+  </div>
+</div>
+
+</main>
+</div>
+
+<script>
+const API = window.location.origin;
+let ws = null, rTimer = null;
+let spreadsMap = {}, tradeHistory = [], statusData = {};
+let isRunning = false;
+let availSymbols = [];
+let accounts = [];
+
+// ── NAV ──
+function go(id, el) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('page-' + id).classList.add('active');
+  if (el) el.classList.add('active');
+}
+
+// ── WS ──
+function connectWS() {
+  const url = API.replace('http','ws') + '/ws';
+  ws = new WebSocket(url);
+  ws.onopen = () => { setDot('panel', true); log('Panel WS подключён', 'success'); if(rTimer){clearTimeout(rTimer);rTimer=null;} };
+  ws.onclose = () => { setDot('panel', false); log('Panel WS отключён, переподключение...','warn'); rTimer=setTimeout(connectWS,2000); };
+  ws.onerror = () => log('WS ошибка','error');
+  ws.onmessage = e => handle(JSON.parse(e.data));
+}
+
+function handle(msg) {
+  if (msg.type === 'init') {
+    (msg.spreads||[]).forEach(s => spreadsMap[s.symbol]=s);
+    tradeHistory = msg.trades||[];
+    if (msg.status) applyStatus(msg.status);
+    renderSlots(); renderAllSpreads(); renderTrades(); renderAccountsHistory();
+  } else if (msg.type === 'spread') {
+    spreadsMap[msg.data.symbol] = msg.data;
+    renderDashSpreads(); updateSlotSpread(msg.data);
+  } else if (msg.type === 'trade_open') {
+    log(`[${accLabel(msg.data.account_id)}] ОТКРЫТА ${msg.data.side} ${msg.data.symbol} @ ${msg.data.entry_price.toFixed(5)} | спред ${msg.data.spread_at_entry.toFixed(4)}% | http ${msg.data.open_http_ms}ms`, 'success');
+    renderTrades(); renderSlots();
+  } else if (msg.type === 'trade_close') {
+    log(`[${accLabel(msg.data.account_id)}] ЗАКРЫТА ${msg.data.side} ${msg.data.symbol} | PnL ${msg.data.pnl>=0?'+':''}${msg.data.pnl.toFixed(4)} $ | ${msg.data.close_reason||'—'}`, msg.data.pnl>=0?'success':'error');
+    tradeHistory.unshift(msg.data);
+    renderTrades(); renderSlots(); renderAccountsHistory();
+  } else if (msg.type === 'log') {
+    log(msg.msg, msg.level||'info');
+  }
+}
+
+function accLabel(id) {
+  const a = accounts.find(x=>x.id===id);
+  return a ? a.label : id;
+}
+
+// ── STATUS POLL ──
+async function poll() {
+  try {
+    const r = await fetch(API+'/api/status');
+    const d = await r.json();
+    applyStatus(d);
+  } catch(e) { setDot('bnb',false); setDot('mexc',false); }
+}
+
+function applyStatus(d) {
+  isRunning = d.running;
+  statusData = d;
+  if (d.accounts) accounts = d.accounts;
+
+  const pnl = d.total_pnl||0;
+  document.getElementById('s-pnl').textContent = (pnl>=0?'+$':'-$') + Math.abs(pnl).toFixed(4);
+  document.getElementById('s-pnl').className = 'stat-val '+(pnl>=0?'g':'r');
+  document.getElementById('s-pnl-sub').textContent = (d.total_trades||0) + ' сделок';
+  document.getElementById('s-wr').textContent = (d.win_rate||0).toFixed(1) + '%';
+  document.getElementById('s-open').textContent = d.open_trades||0;
+  const up = d.uptime_seconds||0;
+  document.getElementById('s-uptime').textContent = `${Math.floor(up/3600)}h ${Math.floor(up%3600/60)}m ${up%60}s`;
+
+  const active = (d.accounts||[]).filter(a=>a.enabled).length;
+  document.getElementById('badge-accs').textContent = active + ' активных';
+
+  setDot('bnb', (d.connected_symbols||0) > 0);
+  setDot('mexc', (d.connected_symbols||0) > 0);
+  updateBotUI(d.running);
+  renderSlots();
+}
+
+function updateBotUI(run) {
+  const pill = document.getElementById('bot-pill');
+  const btn = document.getElementById('btn-run');
+  if (run) {
+    pill.className='pill run'; pill.textContent='RUNNING';
+    btn.className='btn-run running'; btn.textContent='■ ОСТАНОВИТЬ';
+  } else {
+    pill.className='pill stop'; pill.textContent='STOPPED';
+    btn.className='btn-run'; btn.textContent='▶ ЗАПУСТИТЬ';
+  }
+}
+
+async function toggleBot() {
+  const ep = isRunning ? '/api/stop' : '/api/start';
+  try {
+    await fetch(API+ep, {method:'POST'});
+    log(isRunning ? 'Бот остановлен' : 'Бот запущен', isRunning?'warn':'success');
+    await poll();
+  } catch(e) { log('Ошибка подключения к серверу','error'); }
+}
+
+// ── SLOTS ──
+function renderSlots() {
+  const grid = document.getElementById('slots-grid');
+  if (!accounts.length) { grid.innerHTML='<div class="empty">Нет аккаунтов</div>'; return; }
+  grid.innerHTML = accounts.map(a => slotHTML(a)).join('');
+}
+
+function slotHTML(a) {
+  const syms = a.symbols || [a.symbol];
+  // Collect current spread per symbol of this account
+  const perSymSpreads = syms.map(s => {
+    const sp = spreadsMap[s];
+    return { sym: s, pct: sp ? sp.spread_pct : null };
+  });
+  // Legacy `pct` = first symbol's spread (for backward-compat lines)
+  const pct = perSymSpreads.length ? perSymSpreads[0].pct : null;
+  const pnlStr = (a.total_pnl>=0?'+':'')+a.total_pnl.toFixed(4);
+  const pnlClass = a.total_pnl>=0?'g':'r';
+  const wr = a.total_trades ? (a.win_rate||0).toFixed(0)+'%' : '—';
+  const slotClass = 'slot' + (a.in_trade?' active-trade':'') + (a.opening?' opening':'') + (!a.enabled?' disabled':'');
+
+  let statusBadge = '';
+  if (a.blocked) statusBadge = '<span class="blocked-badge">⚠ ' + a.blocked + '</span><button class="unblock-btn" onclick="unblockAccount(\'' + a.id + '\')">🔓 Разблокировать</button>';
+  else if (a.opening) statusBadge = '<span class="opening-badge">⏳ ОТКРЫВАЕТСЯ...</span>';
+  else if (a.in_trade) statusBadge = '<span class="in-trade-badge">В ПОЗИЦИИ</span>';
+  else if (!a.has_uid) statusBadge = '<span class="no-key-badge">Нет U_ID</span>';
+  else if (a.auto_trade) statusBadge = '<span class="ready-badge">Авто-торговля</span>';
+  else statusBadge = '<span style="font-size:9px;color:#5a6080">Ручной режим</span>';
+
+  const spreadStr = pct !== null
+    ? `<span class="${pct>=0?'sprd-pos':'sprd-neg'}">${pct>=0?'+':''}${pct.toFixed(4)}%</span>`
+    : '<span style="color:#5a6080">—</span>';
+
+  return `<div class="${slotClass}" id="slot-${a.id}">
+    <div class="slot-head">
+      <span class="slot-name">${a.label}</span>
+      <span class="slot-sym">◈ ${(a.symbols||[a.symbol]).join(' · ')}</span>
+    </div>
+    <div class="slot-body">
+      <div class="slot-row"><span class="slot-row-lbl">Баланс</span><span class="slot-row-val b">${(a.balance||0).toFixed(2)} USDT</span></div>
+      <div class="slot-row"><span class="slot-row-lbl">PnL</span><span class="slot-row-val ${pnlClass}">${pnlStr} $</span></div>
+      <div class="slot-row"><span class="slot-row-lbl">Сделок / WR</span><span class="slot-row-val b">${a.total_trades} / ${wr}</span></div>
+      <div class="slot-row"><span class="slot-row-lbl">Текущий размер</span><span class="slot-row-val">${computeSizeLabel(a)}</span></div>
+    </div>
+    <div class="slot-status-bar">${statusBadge}</div>
+  </div>`;
+}
+
+function updateSlotSpread(snap) {
+  // Re-render all slot cards so multi-symbol spreads refresh
+  renderAccountSlots();
+  renderDashSpreads();
+}
+
+// ── SPREAD TABLES ──
+function renderDashSpreads() {
+  const activeSyms = new Set();
+  accounts.filter(a=>a.enabled).forEach(a => (a.symbols || [a.symbol]).forEach(s => s && activeSyms.add(s)));
+  const rows = Object.values(spreadsMap).filter(s=>activeSyms.has(s.symbol)).sort((a,b)=>a.symbol.localeCompare(b.symbol));
+  document.getElementById('badge-sprds').textContent = rows.length + ' пар';
+  const tb = document.getElementById('tb-spreads');
+  tb.innerHTML = rows.length ? rows.map(s => dashSpreadRow(s)).join('') : '<tr><td colspan="6" class="empty">Ожидание данных...</td></tr>';
+}
+
+function dashSpreadRow(s) {
+  const p = s.spread_pct, pos = p>=0;
+  const w = Math.min(100, Math.abs(p)*150);
+  const pnlMap = (statusData && statusData.pnl_by_symbol) || {};
+  const trMap = (statusData && statusData.trades_by_symbol) || {};
+  const symPnl = pnlMap[s.symbol] || 0;
+  const symTr = trMap[s.symbol] || 0;
+  const pnlCls = symPnl >= 0 ? 'sprd-pos' : 'sprd-neg';
+  const pnlStr = symTr > 0 ? `<span class="${pnlCls}">${symPnl>=0?'+':''}${symPnl.toFixed(4)} $ (${symTr})</span>` : '<span style="color:#5a6080">—</span>';
+  return `<tr id="drow-${s.symbol}">
+    <td><span class="sym">${s.symbol}</span></td>
+    <td class="price">${s.binance_bid.toFixed(5)}</td>
+    <td class="price">${s.mexc_ask.toFixed(5)}</td>
+    <td class="bar-cell"><div class="bar-wrap"><div class="bar"><div class="bar-fill ${pos?'pos':'neg'}" style="width:${w}%"></div></div><span class="${pos?'sprd-pos':'sprd-neg'}" style="font-size:11px;min-width:54px;text-align:right">${pos?'+':''}${p.toFixed(4)}%</span></div></td>
+    <td><span class="dir ${pos?'buy':'sell'}">${pos?'BUY':'SELL'}</span></td>
+    <td>${pnlStr}</td>
+  </tr>`;
+}
+
+function renderAllSpreads() {
+  const q = (document.getElementById('srch')||{value:''}).value.toUpperCase();
+  const rows = Object.values(spreadsMap).filter(s=>!q||s.symbol.includes(q)).sort((a,b)=>a.symbol.localeCompare(b.symbol));
+  const tb = document.getElementById('tb-spreads-full');
+  tb.innerHTML = rows.length ? rows.map(s => {
+    const p=s.spread_pct,pos=p>=0;
+    return `<tr>
+      <td><span class="sym">${s.symbol}</span></td>
+      <td class="price">${s.binance_bid.toFixed(5)}</td><td class="price">${s.binance_ask.toFixed(5)}</td>
+      <td class="price">${s.mexc_bid.toFixed(5)}</td><td class="price">${s.mexc_ask.toFixed(5)}</td>
+      <td><span class="${pos?'sprd-pos':'sprd-neg'}">${pos?'+':''}${p.toFixed(4)}%</span></td>
+      <td><span class="dir ${pos?'buy':'sell'}">${pos?'BUY':'SELL'}</span></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="empty">Ожидание данных...</td></tr>';
+}
+
+// ── TRADES ──
+function renderAccountsHistory() {
+  const el = document.getElementById('ah-list');
+  if (!el) return;
+  if (!tradeHistory.length) {
+    el.innerHTML = '<div class="ah-empty">Истории ещё нет</div>';
+    return;
+  }
+  el.innerHTML = tradeHistory.slice(0, 30).map(t => {
+    const pnl = t.pnl || 0;
+    const sd = (t.side||'').toUpperCase();
+    const sym = (t.symbol||'').replace('USDT','').replace('_','');
+    const sp = ((t.spread_at_entry||0)).toFixed(2);
+    return `<div class="ah-item">
+      <span class="ah-side ${sd}">${sd}</span>
+      <span class="ah-sym">${sym}</span>
+      <span class="ah-spread">${sp}%</span>
+      <span class="ah-pnl ${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}${pnl.toFixed(4)}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderTrades() {
+  document.getElementById('badge-hist').textContent = tradeHistory.length;
+  const wh = document.getElementById('wrap-hist');
+  wh.innerHTML = tradeHistory.length ? tradeHistory.slice(0,100).map(t=>{
+    const pnl=t.pnl||0, tm=new Date((t.open_time||0)*1000).toLocaleTimeString('ru');
+    return `<div class="trade-item">
+      <span class="t-side ${t.side}">${t.side}</span>
+      <span class="t-acc">${accLabel(t.account_id)}</span>
+      <span class="t-sym">${t.symbol}</span>
+      <span class="t-price">${(t.entry_price||0).toFixed(5)} → ${t.exit_price?(t.exit_price.toFixed(5)):'—'}</span>
+      <span class="t-pnl ${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}${pnl.toFixed(4)} $</span>
+      <span class="t-time">${tm}</span>
+    </div>`;
+  }).join('') : '<div class="empty">История пуста</div>';
+}
+
+// ── SETTINGS ──
+async function loadConfig() {
+  try {
+    const r = await fetch(API+'/api/config');
+    const d = await r.json();
+    availSymbols = d.available_symbols || [];
+    // merge accounts from config (has api keys etc) with status accounts
+    renderSettings(d.accounts||[]);
+  } catch(e) {}
+}
+
+function renderSettings(cfgAccounts) {
+  const layout = document.getElementById('settings-layout');
+  layout.innerHTML = cfgAccounts.map((a,i) => settingsCard(a, i+1)).join('');
+}
+
+function settingsCard(a, num) {
+  const accSymbols = a.symbols || [a.symbol];
+  const symChecks = availSymbols.map(s=>`<label class="sym-chk ${accSymbols.includes(s)?'checked':''}"><input type="checkbox" value="${s}" ${accSymbols.includes(s)?'checked':''} onchange="this.parentElement.classList.toggle('checked', this.checked)">${s}</label>`).join('');
+  return `<div class="cfg-card">
+    <div class="cfg-title">Слот ${num} — <span>${a.label||'Аккаунт '+num}</span></div>
+
+    <div class="form-row">
+      <label class="form-lbl">Название аккаунта</label>
+      <input class="form-input" id="c-${a.id}-label" value="${a.label||''}">
+    </div>
+
+    <div class="form-row">
+      <label class="form-lbl">Монеты для торговли (выбор нескольких)</label>
+      <div class="sym-grid" id="c-${a.id}-symbols">${symChecks}</div>
+    </div>
+
+    <div class="form-row">
+      <label class="form-lbl">MEXC U_ID</label>
+      <input class="form-input" id="c-${a.id}-mexc_uid" placeholder=" cookies " value="${a.mexc_uid||''}">
+    </div>
+
+    <div class="form-row">
+      <label class="form-lbl">Binance API Key (опц.)</label>
+      <input class="form-input" type="password" id="c-${a.id}-binance_api_key" placeholder="Не обязательно (публичный WS)" value="${a.binance_api_key||''}">
+    </div>
+
+    <div style="height:1px;background:var(--border);margin:10px 0"></div>
+
+    <div class="form-row">
+      <label class="form-lbl">Правила размера позиции</label>
+      <table class="rules-table" id="rules-${a.id}">
+        <thead><tr>
+          <th>Баланс от</th><th>до</th><th>Спред от (%)</th><th>до (%)</th><th>Позиция (USDT)</th><th></th>
+        </tr></thead>
+        <tbody>${(a.position_rules||[]).map((r,i)=>`<tr data-ri="${i}">
+          <td><input type="number" step="1" value="${r.balance_min}" data-f="balance_min"></td>
+          <td><input type="number" step="1" value="${r.balance_max===9e9?'':r.balance_max}" data-f="balance_max" placeholder="∞"></td>
+          <td><input type="number" step="0.01" value="${r.spread_min}" data-f="spread_min"></td>
+          <td><input type="number" step="0.01" value="${r.spread_max===9e9?'':r.spread_max}" data-f="spread_max" placeholder="∞"></td>
+          <td><input type="number" step="1" value="${r.size_usdt}" data-f="size_usdt"></td>
+          <td><button class="rm-btn" onclick="rmRule('${a.id}',${i})" title="Удалить">×</button></td>
+        </tr>`).join('')}</tbody>
+      </table>
+      <button class="btn-add-rule" onclick="addRule('${a.id}')">➕ Добавить правило</button>
+    </div>
+    <div class="form-row">
+      <label class="form-lbl">Плечо (x)</label>
+      <input class="form-input" type="number" id="c-${a.id}-leverage" value="${a.leverage||5}">
+    </div>
+    <div class="form-row">
+      <label class="form-lbl">Мин. спред для входа (%)</label>
+      <input class="form-input" type="number" step="0.01" id="c-${a.id}-min_spread_pct" value="${a.min_spread_pct||0.08}">
+    </div>
+    <div class="form-row">
+      <label class="form-lbl">Стоп-лосс (%)</label>
+      <input class="form-input" type="number" step="0.01" id="c-${a.id}-stop_loss_pct" value="${a.stop_loss_pct||0.04}">
+    </div>
+
+    <div style="height:1px;background:var(--border);margin:10px 0"></div>
+
+    <div class="form-row">
+      <label class="form-lbl">Прокси (JP, опц.)</label>
+      <input class="form-input" id="c-${a.id}-proxy_url" placeholder="http://user:pass@jp:3128" value="${a.proxy_url||''}">
+    </div>
+
+    <div class="form-row-inline">
+      <span class="form-lbl" style="margin:0">Авто-торговля</span>
+      <label class="toggle"><input type="checkbox" id="c-${a.id}-auto_trade" ${a.auto_trade?'checked':''}><span class="tslider"></span></label>
+    </div>
+    <div class="form-row-inline">
+      <span class="form-lbl" style="margin:0">Аккаунт активен</span>
+      <label class="toggle"><input type="checkbox" id="c-${a.id}-enabled" ${a.enabled?'checked':''}><span class="tslider"></span></label>
+    </div>
+
+    <button class="btn-save" onclick="saveAccount('${a.id}', this)">✓ Сохранить</button>
+    <button class="btn-reset" onclick="resetStats('${a.id}')" title="Сбросить PnL и счётчик сделок">⟲ Сбросить статистику</button>
+    <span class="save-ok" id="ok-${a.id}">Сохранено!</span>
+  </div>`;
+}
+
+async function resetStats(id) {
+  if (!confirm('Сбросить статистику (PnL, сделки, win rate) для ' + id + '?')) return;
+  try {
+    const r = await fetch(API+'/api/accounts/'+id+'/reset_stats', {method:'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      alert('✓ Статистика сброшена');
+    } else {
+      alert('Не удалось: ' + (j.message || 'unknown'));
+    }
+  } catch(e) { alert('Ошибка: ' + e); }
+}
+
+async function unblockAccount(id) {
+  if (!confirm('Разблокировать аккаунт ' + id + '? Убедитесь что верификация на MEXC пройдена.')) return;
+  try {
+    const r = await fetch(API+'/api/accounts/'+id+'/unblock', {method:'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      alert('✓ Разблокировано. Не забудьте включить Авто-торговлю заново.');
+    } else {
+      alert('Не удалось: ' + (j.message || 'unknown'));
+    }
+  } catch(e) { alert('Ошибка: ' + e); }
+}
+
+function computeSizeLabel(acc) {
+  const rules = acc.position_rules || [];
+  const bal = acc.balance || 0;
+  // Use current observed spread if available, else show range of possible sizes
+  const spread = (statusData.spreads && statusData.spreads[acc.symbol]) ? Math.abs(statusData.spreads[acc.symbol].spread_pct) : null;
+  if (spread !== null) {
+    for (const r of rules) {
+      if (bal >= r.balance_min && bal < r.balance_max && spread >= r.spread_min && spread < r.spread_max) {
+        return r.size_usdt + ' USDT';
+      }
+    }
+    return '— (нет правила)';
+  }
+  // No live spread — show min..max for current balance
+  const matching = rules.filter(r => bal >= r.balance_min && bal < r.balance_max);
+  if (!matching.length) return '— (нет правила)';
+  const sizes = matching.map(r => r.size_usdt);
+  const mn = Math.min(...sizes), mx = Math.max(...sizes);
+  return mn === mx ? (mn + ' USDT') : (mn + '–' + mx + ' USDT');
+}
+
+function addRule(accId) {
+  const acc = (statusData.accounts||[]).find(a=>a.id===accId);
+  if (!acc) return;
+  acc.position_rules = acc.position_rules || [];
+  acc.position_rules.push({balance_min:0, balance_max:9e9, spread_min:0, spread_max:9e9, size_usdt:100});
+  renderSettings();
+}
+function rmRule(accId, idx) {
+  const acc = (statusData.accounts||[]).find(a=>a.id===accId);
+  if (!acc || !acc.position_rules) return;
+  acc.position_rules.splice(idx, 1);
+  renderSettings();
+}
+function collectRules(accId) {
+  const tbody = document.querySelector(`#rules-${accId} tbody`);
+  if (!tbody) return [];
+  const rows = [...tbody.querySelectorAll('tr')];
+  return rows.map(tr => {
+    const obj = {};
+    tr.querySelectorAll('input').forEach(inp => {
+      const v = inp.value.trim();
+      const f = inp.dataset.f;
+      if (v === '' && (f === 'balance_max' || f === 'spread_max')) {
+        obj[f] = 9e9;
+      } else {
+        obj[f] = parseFloat(v) || 0;
+      }
+    });
+    return obj;
+  });
+}
+
+async function saveAccount(id, btn) {
+  const g = k => document.getElementById(`c-${id}-${k}`);
+  const data = {
+    label: g('label').value,
+    symbols: [...document.querySelectorAll(`#c-${id}-symbols input:checked`)].map(i=>i.value),
+    mexc_uid: g('mexc_uid').value,
+    binance_api_key: g('binance_api_key').value,
+    position_rules: collectRules(id),
+    leverage: parseInt(g('leverage').value),
+    min_spread_pct: parseFloat(g('min_spread_pct').value),
+    stop_loss_pct: parseFloat(g('stop_loss_pct').value),
+    proxy_url: g('proxy_url').value,
+    auto_trade: g('auto_trade').checked,
+    enabled: g('enabled').checked,
+  };
+  try {
+    await fetch(API+'/api/accounts/'+id, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+    const ok = document.getElementById('ok-'+id);
+    ok.style.display='inline'; setTimeout(()=>ok.style.display='none',2000);
+    log(`[${data.label}] Настройки сохранены`, 'success');
+    await poll();
+  } catch(e) { log('Ошибка сохранения','error'); }
+}
+
+// ── STATUS DOTS ──
+function setDot(name, ok) {
+  const d = document.getElementById('dot-'+name);
+  const l = document.getElementById('lbl-'+name);
+  if (!d) return;
+  d.className = 'dot' + (ok?' ok':'');
+  const labels = {bnb:'Binance', mexc:'MEXC', panel:'Panel'};
+  l.textContent = labels[name] + (ok?' ✓':'');
+}
+
+// ── LOG ──
+function log(msg, level='info') {
+  const wrap = document.getElementById('log-wrap');
+  const t = new Date().toLocaleTimeString('ru');
+  const el = document.createElement('div');
+  el.className='log-line';
+  el.innerHTML=`<span class="log-t">${t}</span><span class="log-m ${level}">${msg}</span>`;
+  wrap.insertBefore(el, wrap.firstChild);
+  while(wrap.children.length>300) wrap.removeChild(wrap.lastChild);
+}
+
+// ── INIT ──
+connectWS();
+loadConfig();
+poll();
+setInterval(poll, 3000);
+
+log('Панель загружена', 'info');
+</script>
+</body>
+</html>

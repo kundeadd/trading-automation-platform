@@ -1,0 +1,309 @@
+//! Monitor: підписується на broadcast price_updates, відстежує відкриту позицію.
+//! Закриваємось ТІЛЬКИ коли спред звузився до converge_threshold_pct.
+//! Без stop-loss, без timeout — тримаємо позицію скільки треба.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use serde_json::Value;
+use tokio::sync::broadcast::error::RecvError;
+use tracing::{debug, info, warn};
+
+use crate::config::Config;
+use crate::mexc::http::MexcClient;
+use crate::state::{now_ms, State, Trade};
+
+/// Cooldown після закриття (мс) — щоб strategy не зайшла знову миттєво.
+const COOLDOWN_AFTER_CLOSE_MS: u64 = 1000;
+
+/// Скільки мс поспіль спред має залишатись у зоні converge перед закриттям.
+/// Це фільтрує одно-тікові спайки і ловить більший рух ціни.
+const CONFIRM_CONVERGE_MS: u64 = 300;
+
+pub async fn run_monitor(cfg: Arc<Config>, state: Arc<State>, http: MexcClient) {
+    let mut rx = state.price_updates.subscribe();
+    info!(target: "monitor", "started, converge_threshold={}% (confirm {}ms)",
+          cfg.trading.converge_threshold_pct, CONFIRM_CONVERGE_MS);
+
+    // converge_started_at: коли спред вперше потрапив у зону convergence для поточної позиції.
+    // None = ще не входив у зону, або позиції немає, або вистрибнув назад.
+    let mut converge_started_at: Option<u64> = None;
+    let mut last_trade_id: String = String::new();
+
+    loop {
+        match rx.recv().await {
+            Ok(()) => {}
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => {
+                warn!(target: "monitor", "price_updates closed, exiting");
+                return;
+            }
+        }
+
+        check_and_close(&cfg, &state, &http, &mut converge_started_at, &mut last_trade_id).await;
+    }
+}
+
+#[inline]
+async fn check_and_close(
+    cfg: &Config,
+    state: &Arc<State>,
+    http: &MexcClient,
+    converge_started_at: &mut Option<u64>,
+    last_trade_id: &mut String,
+) {
+    // 1. Швидка перевірка — чи є відкрита позиція. RwLock.read() = наносекунди.
+    let trade = match state.open_trade.read().clone() {
+        Some(t) => t,
+        None => {
+            // Позиції немає — скидаємо tracking (готуємось до наступного trade)
+            *converge_started_at = None;
+            last_trade_id.clear();
+            return;
+        }
+    };
+
+    // Новий trade — скидаємо tracking
+    if trade.id != *last_trade_id {
+        *converge_started_at = None;
+        *last_trade_id = trade.id.clone();
+    }
+
+    // 2. Беремо актуальні ціни (атомарне читання з DashMap)
+    let mexc = match state.mexc_prices.get(&trade.symbol) {
+        Some(p) => *p,
+        None => return,
+    };
+    let bnc = match state.binance_prices.get(&trade.symbol) {
+        Some(p) => *p,
+        None => return,
+    };
+
+    if mexc.bid <= 0.0 || mexc.ask <= 0.0 || bnc.bid <= 0.0 || bnc.ask <= 0.0 {
+        return;
+    }
+
+    // 3. Рахуємо ПОТОЧНИЙ спред у тому ж напрямку що entry.
+    //    LONG  entry формула: (binance.bid - mexc.ask) / mexc.ask
+    //    SHORT entry формула: (mexc.bid - binance.ask) / binance.ask
+    let current_spread = match trade.side.as_str() {
+        "LONG" => (bnc.bid - mexc.ask) / mexc.ask * 100.0,
+        "SHORT" => (mexc.bid - bnc.ask) / bnc.ask * 100.0,
+        _ => return, // невідомий side — ігноруємо
+    };
+
+;
+    if stop_triggered {
+        let exit_price_sl = match trade.side.as_str() {
+            "LONG"  => mexc.bid,
+            "SHORT" => mexc.ask,
+            _ => 0.0,
+        };
+        let symbol_sl = trade.symbol.clone();
+        let mexc_sym_sl = if symbol_sl.contains('_') { symbol_sl.clone() } else { symbol_sl.replace("USDT", "_USDT") };
+        let position_id_sl = if trade.position_id != 0 {
+            trade.position_id
+        } else {
+            match fetch_position_id(http, &mexc_sym_sl).await {
+                Some(pid) => pid,
+                None => {
+                    warn!(target: "monitor", "🛑 STOP-LOSS: cannot fetch position_id for {}", symbol_sl);
+                    return;
+                }
+            }
+        };
+        let orig_side_sl = match trade.side.as_str() {
+            "LONG"  => 1,
+            "SHORT" => 3,
+            _ => return,
+        };
+        let t_sl = crate::state::now_ms();
+        let result_sl = http.close_position_fast(&mexc_sym_sl, position_id_sl, trade.size, orig_side_sl).await;
+        let elapsed_sl = crate::state::now_ms().saturating_sub(t_sl);
+        match result_sl {
+            Ok(resp_sl) => {
+                let success = resp_sl.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                let code    = resp_sl.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+                if !success || code != 0 {
+                    warn!(target: "monitor", "🛑 STOP-LOSS close rejected: {} resp={}", symbol_sl, resp_sl);
+                    return;
+                }
+                let csize = crate::config::contract_size(&trade.symbol);
+                let pnl_sl = match trade.side.as_str() {
+                    "LONG"  => (exit_price_sl - trade.entry_price) * trade.size * csize,
+                    "SHORT" => (trade.entry_price - exit_price_sl) * trade.size * csize,
+                    _ => 0.0,
+                };
+                warn!(target: "monitor",
+                      "🛑 STOP-LOSS CLOSED {} {} entry={:.6} exit={:.6} pnl={:.4} http={}ms",
+                      trade.side, symbol_sl, trade.entry_price, exit_price_sl, pnl_sl, elapsed_sl);
+                let close_oid_sl = resp_sl.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                let mut closed_sl = trade;
+                let life_ms_sl = now_ms().saturating_sub(closed_sl.open_time_ms);
+                closed_sl.exit_price  = exit_price_sl;
+                closed_sl.pnl         = pnl_sl;
+                closed_sl.status      = "STOP".to_string();
+                closed_sl.close_reason = format!("STOP-LOSS {:.0}ms", life_ms_sl);
+                closed_sl.close_order_id = close_oid_sl;
+                closed_sl.close_time_ms  = crate::state::now_ms();
+                state.trade_history.write().push(closed_sl);
+                *state.open_trade.write() = None;
+                state.cooldown_until_ms.store(crate::state::now_ms() + COOLDOWN_AFTER_CLOSE_MS, std::sync::atomic::Ordering::Relaxed);
+                state.total_trades.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *state.total_pnl.lock() += pnl_sl;
+            }
+            Err(e_sl) => {
+                warn!(target: "monitor", "🛑 STOP-LOSS close FAILED {}: {}", symbol_sl, e_sl);
+            }
+        }
+        return;
+    }
+
+    // 4. Конвергенція досягнута? (з підтвердженням)
+    let threshold = cfg.trading.converge_threshold_pct;
+    let now = now_ms();
+
+    if current_spread < -0.01 {
+        warn!(target: "monitor", "🚨 SPREAD NEGATIVE {:.4}% — force close", current_spread);
+        *converge_started_at = Some(now.saturating_sub(CONFIRM_CONVERGE_MS + 1));
+    } else if current_spread > threshold {
+        // Вистрибнув назад — скидаємо timer
+        if converge_started_at.is_some() {
+            debug!(target: "monitor", "converge broken: spread {:.4}% > {:.4}%, resetting timer",
+                   current_spread, threshold);
+        }
+        *converge_started_at = None;
+        return;
+    }
+
+    // У зоні convergence. Запускаємо/перевіряємо timer.
+    match *converge_started_at {
+        None => {
+            // Перший раз — запам'ятовуємо момент
+            *converge_started_at = Some(now);
+            debug!(target: "monitor", "converge started: spread={:.4}% threshold={:.4}%",
+                   current_spread, threshold);
+            return;
+        }
+        Some(started) => {
+            let elapsed = now.saturating_sub(started);
+            if elapsed < CONFIRM_CONVERGE_MS {
+                // Ще не підтверджено — чекаємо
+                return;
+            }
+            // Підтверджено — закриваємо
+            debug!(target: "monitor", "converge confirmed after {}ms: spread={:.4}%",
+                   elapsed, current_spread);
+        }
+    }
+
+    // 5. Закриваємо. Викликаємо close_position_fast.
+    //    Якщо position_id == 0 — спочатку отримуємо через REST.
+    let symbol = trade.symbol.clone();
+    let mexc_sym = if symbol.contains('_') { symbol.clone() } else { symbol.replace("USDT", "_USDT") };
+
+    let position_id = if trade.position_id != 0 {
+        trade.position_id
+    } else {
+        match fetch_position_id(http, &mexc_sym).await {
+            Some(pid) => pid,
+            None => {
+                warn!(target: "monitor", "cannot fetch position_id for {}, skipping close", symbol);
+                return;
+            }
+        }
+    };
+
+    let orig_side = match trade.side.as_str() {
+        "LONG" => 1,
+        "SHORT" => 3,
+        _ => return,
+    };
+
+    let exit_price = match trade.side.as_str() {
+        "LONG" => mexc.bid,   // закриваємо лонг — продаємо по bid
+        "SHORT" => mexc.ask,  // закриваємо шорт — купуємо по ask
+        _ => return,
+    };
+
+    let t_send = now_ms();
+    let result = http.close_position_fast(&mexc_sym, position_id, trade.size, orig_side).await;
+    let elapsed = now_ms().saturating_sub(t_send);
+
+    match result {
+        Ok(resp) => {
+            let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+            let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+
+            if !success || code != 0 {
+                warn!(target: "monitor",
+                      "close rejected: sym={} side={} pid={} resp={}",
+                      symbol, trade.side, position_id, resp);
+                return;
+            }
+
+            // PnL приблизний — точний прийде з ws_private (з dedup orderId).
+            // ВАЖЛИВО: trade.size = контракти, треба × contract_size щоб отримати USDT.
+            // TAO: csize=0.01 (1 контракт = 0.01 TAO), ASTER: csize=1.0
+            let csize = crate::config::contract_size(&trade.symbol);
+            let approx_pnl = match trade.side.as_str() {
+                "LONG" => (exit_price - trade.entry_price) * trade.size * csize,
+                "SHORT" => (trade.entry_price - exit_price) * trade.size * csize,
+                _ => 0.0,
+            };
+
+            let close_oid = resp
+                .get("data")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            info!(target: "monitor",
+                  "🔴 CLOSE {} {} entry={} exit={} spread_now={:.4}% approx_pnl={:.4} http={}ms",
+                  trade.side, symbol, trade.entry_price, exit_price, current_spread, approx_pnl, elapsed);
+
+            // Оновлюємо trade і пишемо в history
+            let mut closed = trade;
+            let life_ms = now_ms().saturating_sub(closed.open_time_ms);
+            closed.exit_price = exit_price;
+            closed.pnl = approx_pnl;
+            closed.status = "CLOSED".to_string();
+            closed.close_reason = format!("CONVERGE {:.0}ms", life_ms);
+            closed.close_order_id = close_oid;
+            closed.close_time_ms = now_ms();
+
+            state.trade_history.write().push(closed);
+            *state.open_trade.write() = None;
+
+            // Cooldown щоб strategy не зайшла миттєво
+            state.cooldown_until_ms.store(now_ms() + COOLDOWN_AFTER_CLOSE_MS, Ordering::Relaxed);
+
+            // Оновлюємо статистику
+            state.total_trades.fetch_add(1, Ordering::Relaxed);
+            if approx_pnl > 0.0 {
+                state.winning_trades.fetch_add(1, Ordering::Relaxed);
+            }
+            *state.total_pnl.lock() += approx_pnl;
+        }
+        Err(e) => {
+            warn!(target: "monitor", "close failed for {}: {} ({}ms)", symbol, e, elapsed);
+            // Не чистимо open_trade — спробуємо знову при наступному тригері
+        }
+    }
+}
+
+/// Отримати position_id з REST (fallback коли немає в trade).
+/// Повертає None якщо позицій немає або помилка.
+async fn fetch_position_id(http: &MexcClient, mexc_sym: &str) -> Option<i64> {
+    let resp: Value = http.get_positions(Some(mexc_sym)).await.ok()?;
+    let data = resp.get("data")?.as_array()?;
+    // Беремо першу відкриту позицію по символу
+    for pos in data {
+        let pid = pos.get("positionId").and_then(|v| v.as_i64())?;
+        let hold = pos.get("holdVol").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if hold > 0.0 {
+            return Some(pid);
+        }
+    }
+    None
+}

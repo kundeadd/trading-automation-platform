@@ -1,0 +1,120 @@
+mod config;
+mod state;
+mod mexc;
+mod binance;
+mod strategy;
+mod monitor;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+type DynErr = Box<dyn std::error::Error + Send + Sync>;
+
+#[tokio::main]
+async fn main() -> Result<(), DynErr> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mexc_ws=debug,binance_ws=debug")),
+        )
+        .init();
+
+    let cfg = Arc::new(config::Config::load("config.toml")?);
+    println!("✅ Config loaded: account={}, symbols={:?}", cfg.account.label, cfg.trading.symbols);
+
+    let state = state::State::new();
+    println!("✅ State created");
+
+    let client = mexc::http::MexcClient::new(cfg.account.mexc_uid.clone(), &cfg.account.proxy_url)?;
+    println!("✅ MEXC client created");
+
+    let bal = client.get_balance().await?;
+    println!("✅ Balance: {} USDT", bal);
+
+    // === Запуск обох WS у фоні ===
+    println!("\n=== Starting MEXC + Binance WS (60s test) ===");
+
+    let cfg_mexc = cfg.clone();
+    let state_mexc = state.clone();
+    tokio::spawn(async move {
+        mexc::ws_public::run_mexc_public_ws(cfg_mexc, state_mexc).await;
+    });
+
+    // === MEXC private WS (PnL fix + position_id) ===
+    let cfg_priv = cfg.clone();
+    let state_priv = state.clone();
+    tokio::spawn(async move {
+        mexc::ws_private::run_mexc_private_ws(cfg_priv, state_priv).await;
+    });
+
+    let cfg_bnc = cfg.clone();
+    let state_bnc = state.clone();
+    tokio::spawn(async move {
+        binance::ws::run_binance_ws(cfg_bnc, state_bnc).await;
+    });
+
+    // === Стратегія ===
+    let cfg_strat = cfg.clone();
+    let state_strat = state.clone();
+    let client_strat = client.clone();
+    tokio::spawn(async move {
+        strategy::run_strategy(cfg_strat, state_strat, client_strat).await;
+    });
+
+    // === Monitor (закриття позицій) ===
+    let cfg_mon = cfg.clone();
+    let state_mon = state.clone();
+    let client_mon = client.clone();
+    tokio::spawn(async move {
+        monitor::run_monitor(cfg_mon, state_mon, client_mon).await;
+    });
+
+    // Цикл виводу: обидві біржі + спред між ними
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(60) {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let now = state::now_ms();
+
+        for sym in &cfg.trading.symbols {
+            let mexc = state.mexc_prices.get(sym);
+            let bnc = state.binance_prices.get(sym);
+
+            match (mexc, bnc) {
+                (Some(m), Some(b)) => {
+                    let m_age = now.saturating_sub(m.timestamp_ms);
+                    let b_age = now.saturating_sub(b.timestamp_ms);
+
+                    // Спред у двох напрямках:
+                    // SHORT-MEXC / LONG-Binance: продаємо на MEXC по bid, купуємо на Binance по ask
+                    let short_mexc = (m.bid - b.ask) / b.ask * 100.0;
+                    // LONG-MEXC / SHORT-Binance: купуємо на MEXC по ask, продаємо на Binance по bid
+                    let long_mexc = (b.bid - m.ask) / m.ask * 100.0;
+
+                    let max_spread = short_mexc.max(long_mexc);
+                    let direction = if short_mexc > long_mexc { "S-MEXC/L-BNC" } else { "L-MEXC/S-BNC" };
+
+                    println!(
+                        "  {} | MEXC {:.6}/{:.6} ({}ms) | BNC {:.6}/{:.6} ({}ms) | SPREAD {:+.4}% [{}]",
+                        sym,
+                        m.bid, m.ask, m_age,
+                        b.bid, b.ask, b_age,
+                        max_spread, direction
+                    );
+                }
+                (Some(m), None) => {
+                    println!("  {} | MEXC {:.6}/{:.6} | BNC <no data>", sym, m.bid, m.ask);
+                }
+                (None, Some(b)) => {
+                    println!("  {} | MEXC <no data> | BNC {:.6}/{:.6}", sym, b.bid, b.ask);
+                }
+                (None, None) => {
+                    println!("  {} | <no data on either>", sym);
+                }
+            }
+        }
+        println!();
+    }
+
+    println!("=== Test finished ===");
+    Ok(())
+}
